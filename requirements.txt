@@ -1,2 +1,1 @@
-requests>=1.0.0
-python-magic>=1.0.0
+# Only the Python standard library and a docker installation are required.

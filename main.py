@@ -2,15 +2,16 @@ import argparse
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
-import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define some constants
-SANDBOX_IMAGE = "ubuntu:latest"  # Replace with a more secure, minimal image
+SANDBOX_IMAGE = "ubuntu:22.04"  # Pinned tag, not the mutable latest tag
+SANDBOX_USER = "65534:65534"  # Non-root user (nobody) inside the container
 CONTAINER_NAME = "artifact_sandbox"
 REPORT_FILE = "sandbox_report.txt"
 TIMEOUT = 60  # Timeout for artifact execution (seconds)
@@ -69,10 +70,16 @@ def run_in_sandbox(artifact, timeout):
         timeout (int): Timeout in seconds for execution.
 
     Returns:
-        tuple: (stdout, stderr, return_code) from the process.  None if container fails.
+        tuple: (stdout, stderr, return_code, filesystem_changes) from the
+        process, where filesystem_changes is the docker diff output
+        collected before the container is removed. None if the
+        container fails.
     """
     try:
-        # Create the container (using a more restrictive security profile is crucial)
+        # Create the container with a restrictive security profile:
+        # all capabilities dropped, a non-root user, a read-only root
+        # filesystem with a tmpfs scratch area, and the artifact
+        # mounted read-only.
         subprocess.run(
             [
                 "docker",
@@ -84,15 +91,22 @@ def run_in_sandbox(artifact, timeout):
                 "--pids-limit", "100", #Limit pids
                 "--memory", "256m", # Limit memory usage
                 "--cpus", "0.5", # limit CPU usage
+                "--cap-drop", "ALL",
+                "--user", SANDBOX_USER,
+                "--read-only",
+                "--tmpfs", "/tmp",
                 "-v",
-                f"{os.path.abspath(artifact)}:/artifact", # mount the artifact
-                SANDBOX_IMAGE, # Use a minimal image
+                f"{os.path.abspath(artifact)}:/artifact:ro", # mount the artifact read-only
+                SANDBOX_IMAGE,
                 "tail", "-f", "/dev/null" # Keep container running
             ],
             check=True,  # Raise exception on non-zero exit code
             capture_output=True,
             text=True
         )
+    except FileNotFoundError:
+        logging.error("Docker is unavailable: the docker binary was not found.")
+        return None
     except subprocess.CalledProcessError as e:
         logging.error(f"Error creating container: {e.stderr}")
         return None
@@ -108,14 +122,19 @@ def run_in_sandbox(artifact, timeout):
             capture_output=True,
             text=True
         )
+    except FileNotFoundError:
+        logging.error("Docker is unavailable: the docker binary was not found.")
+        cleanup_container()
+        return None
     except subprocess.CalledProcessError as e:
         logging.error(f"Error starting container: {e.stderr}")
         cleanup_container()
         return None
 
     try:
-        # Execute the artifact inside the container
-        cmd = ["docker", "exec", "-it", CONTAINER_NAME, "bash", "-c", f"timeout {timeout} /artifact"]
+        # Execute the artifact inside the container. No -it flags: the
+        # process runs with piped output and no terminal attached.
+        cmd = ["docker", "exec", "--user", SANDBOX_USER, CONTAINER_NAME, "bash", "-c", f"timeout {timeout} /artifact"]
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -134,7 +153,25 @@ def run_in_sandbox(artifact, timeout):
 
         return_code = process.returncode
 
-        return stdout, stderr, return_code
+        # Record filesystem modifications inside the container before
+        # cleanup removes it.
+        try:
+            diff_result = subprocess.run(
+                ["docker", "diff", CONTAINER_NAME],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            filesystem_changes = diff_result.stdout or ""
+        except FileNotFoundError:
+            logging.error("Docker is unavailable: the docker binary was not found.")
+            filesystem_changes = ""
+
+        return stdout, stderr, return_code, filesystem_changes
+
+    except FileNotFoundError:
+        logging.error("Docker is unavailable: the docker binary was not found.")
+        return None
 
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing artifact: {e}")
@@ -177,8 +214,8 @@ def analyze_behavior(stdout, stderr, return_code, artifact_path):
     if "rm -rf /" in stdout or "rm -rf /" in stderr:
         indicators.append("Attempted to delete the entire file system (rm -rf /)")
 
-    # Check for network activity (example: connecting to known malicious IPs)
-    # (requires enabling network monitoring in the sandbox)
+    # Network activity is not observed: the container runs with
+    # networking disabled, so there is no network activity to check.
 
     # Check for file system modifications (example: creating executable files)
     if "chmod +x" in stdout or "chmod +x" in stderr:
@@ -200,7 +237,7 @@ def analyze_behavior(stdout, stderr, return_code, artifact_path):
     return indicators
 
 
-def generate_report(artifact, hash_value, stdout, stderr, indicators, report_file, timeout):
+def generate_report(artifact, hash_value, stdout, stderr, indicators, report_file, timeout, filesystem_changes=""):
     """
     Generates a report summarizing the artifact's behavior.
 
@@ -225,6 +262,18 @@ def generate_report(artifact, hash_value, stdout, stderr, indicators, report_fil
             f.write("\n")
             f.write("Execution Output (stderr):\n")
             f.write(stderr)
+            f.write("\n")
+            f.write("Filesystem Modifications (docker diff, collected before cleanup):\n")
+            if filesystem_changes.strip():
+                f.write(filesystem_changes)
+                if not filesystem_changes.endswith("\n"):
+                    f.write("\n")
+            else:
+                f.write("No filesystem modifications recorded.\n")
+            f.write("\n")
+            f.write("Collection Limits:\n")
+            f.write("No syscall trace is collected.\n")
+            f.write("Network activity is not observed because the container runs with networking disabled.\n")
             f.write("\n")
             f.write("Potential Malicious Behavior:\n")
             if indicators:
@@ -259,6 +308,14 @@ def main():
         logging.error("Timeout must be a positive integer.")
         sys.exit(1)
 
+    if os.path.realpath(args.report) == os.path.realpath(args.artifact):
+        logging.error("Report path must not be the artifact itself.")
+        sys.exit(1)
+
+    if shutil.which("docker") is None:
+        logging.error("Docker is unavailable: the docker binary was not found on PATH.")
+        sys.exit(1)
+
     # Calculate the hash of the artifact
     hash_value = calculate_hash(args.artifact)
     if not hash_value:
@@ -272,13 +329,15 @@ def main():
         logging.error("Sandbox execution failed.")
         sys.exit(1)
 
-    stdout, stderr, return_code = result
+    stdout, stderr, return_code, filesystem_changes = result
 
     # Analyze the artifact's behavior
     indicators = analyze_behavior(stdout, stderr, return_code, args.artifact)
+    if filesystem_changes.strip():
+        indicators.append("Filesystem modifications were recorded inside the container (see the docker diff section of this report).")
 
     # Generate the report
-    generate_report(args.artifact, hash_value, stdout, stderr, indicators, args.report, args.timeout)
+    generate_report(args.artifact, hash_value, stdout, stderr, indicators, args.report, args.timeout, filesystem_changes)
 
     logging.info("Artifact analysis complete.")
 
