@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Define some constants
 SANDBOX_IMAGE = "ubuntu:22.04"  # Pinned tag, not the mutable latest tag
 SANDBOX_USER = "65534:65534"  # Non-root user (nobody) inside the container
+# The container name is fixed, so two runs on the same host cannot overlap. The second create fails on the name while the first still holds it, and the error reads like a Docker problem instead of a busy problem.
 CONTAINER_NAME = "artifact_sandbox"
 REPORT_FILE = "sandbox_report.txt"
 TIMEOUT = 60  # Timeout for artifact execution (seconds)
@@ -53,6 +54,7 @@ def calculate_hash(filepath):
     try:
         hasher = hashlib.sha256()
         with open(filepath, "rb") as afile:
+            # I read the whole artifact into memory to hash it. Fine for the small files this tool is aimed at, and a real limit for a large image or archive, where a chunked read would cost nothing to switch to.
             buf = afile.read()
             hasher.update(buf)
         return hasher.hexdigest()
@@ -134,6 +136,7 @@ def run_in_sandbox(artifact, timeout):
     try:
         # Execute the artifact inside the container. No -it flags: the
         # process runs with piped output and no terminal attached.
+        # The artifact runs as a direct path under bash, so it needs an execute bit and, if it is a script, a shebang the kernel can read. A plain text file or a non executable upload dies instantly here and the report shows that failure, not any behavior of the artifact itself.
         cmd = ["docker", "exec", "--user", SANDBOX_USER, CONTAINER_NAME, "bash", "-c", f"timeout {timeout} /artifact"]
         process = subprocess.Popen(
             cmd,
@@ -145,6 +148,7 @@ def run_in_sandbox(artifact, timeout):
         # Wait for the process to complete with a timeout
         try:
             stdout, stderr = process.communicate(timeout=timeout)
+        # There are two timers on the same run: the timeout command inside the container and this communicate timeout outside, both set to the same value. Which one fires is a race, so a timed out run is not always labelled the same way in the log.
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
@@ -156,6 +160,7 @@ def run_in_sandbox(artifact, timeout):
         # Record filesystem modifications inside the container before
         # cleanup removes it.
         try:
+            # The diff has to be taken in this window, while the container still exists. Move it after the finally cleanup and it would always come back empty, with no error to say why.
             diff_result = subprocess.run(
                 ["docker", "diff", CONTAINER_NAME],
                 capture_output=True,
@@ -224,12 +229,14 @@ def analyze_behavior(stdout, stderr, return_code, artifact_path):
     if return_code != 0:
         indicators.append(f"Non-zero return code: {return_code}")
 
+    # Length is the whole test here. Ten thousand characters of ordinary output trips the same line as a real flood, so I read this indicator as a prompt to open the output section, never as a finding on its own.
     if len(stdout) > 10000:
         indicators.append(f"Excessive stdout: possible buffer overflow exploit")
 
     if len(stderr) > 10000:
         indicators.append(f"Excessive stderr: possible error loop")
 
+    # This last check looks at the artifact on the host, after the run, not at anything the artifact did inside the container. Almost every real sample will carry the bit, so this line is close to a property of the file, not a behavior.
     if os.access(artifact_path, os.X_OK):
       indicators.append("The artifact is executable.")
 
