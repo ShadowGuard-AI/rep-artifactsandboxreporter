@@ -6,15 +6,16 @@ Execution conditions inside the sandbox, stated plainly: the artifact runs as a 
 The report path (--report) must not be the artifact itself; such a run is refused with exit code 1. If the docker binary is not available, the run ends with exit code 1 and a clear docker unavailable message. - Focused on Automates the process of collecting and evaluating the reputation of digital artifacts (files, URLs, IPs) by querying public threat intelligence feeds and sandboxes.  It uses file hashing and URL analysis to provide a preliminary risk assessment.
 
 ## Install
-`git clone https://github.com/ShadowGuardAI/rep-artifactsandboxreporter`
+`git clone https://github.com/ShadowGuard-AI/rep-artifactsandboxreporter`
 
 ## Usage
-`./rep-artifactsandboxreporter [params]`
+`python3 main.py artifact [--timeout 60] [--report sandbox_report.txt]`
 
 ## Parameters
-- `-h`: Show help message and exit
-- `--timeout`: Timeout in seconds for artifact execution.
-- `--report`: Path to the report file. It must not be the artifact itself.
+- `artifact` (required): The path to the artifact to analyze.
+- `-h, --help`: Show help message and exit
+- `--timeout`: Timeout in seconds for artifact execution (default: 60).
+- `--report`: Path to the report file (default: sandbox_report.txt). It must not be the artifact itself.
 
 ## License
-Copyright (c) ShadowGuardAI
+MIT License. See LICENSE.
